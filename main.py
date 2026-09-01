@@ -1,3 +1,17 @@
+"""
+SugarTalk Backend
+==================
+Loads the trained diabetes screening model + threshold, exposes a /predict
+endpoint that:
+    1. Runs the sklearn model to get a risk probability
+    2. Buckets that into a risk tier (Low / Moderate / High)
+    3. Calls the Gemini API to turn that into a short, plain-language
+       set of tips + a recommendation to get confirmatory lab testing
+
+Environment variables expected (set these in Render, not in code):
+    GEMINI_API_KEY -> your Gemini API key from aistudio.google.com/apikey
+"""
+
 import os
 import pickle
 from typing import Literal
@@ -11,14 +25,16 @@ from pydantic import BaseModel, Field
 app = FastAPI(title="SugarTalk Diabetes Screening API")
 
 # --- CORS ---
+# Allows Lovable and local development clients to call the API
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# --- Load model artifacts ---
+# --- Load model artifacts once at startup ---
 BASE_DIR = os.path.dirname(__file__)
 MODEL_PATH = os.path.join(BASE_DIR, "diabetes_screening_model.pkl")
 THRESHOLD_PATH = os.path.join(BASE_DIR, "screening_threshold.pkl")
@@ -29,12 +45,14 @@ with open(MODEL_PATH, "rb") as f:
 with open(THRESHOLD_PATH, "rb") as f:
     flag_threshold = pickle.load(f)
 
-# --- Gemini Client ---
-gemini_client = genai.Client()
+# --- Gemini Client (Safe Startup) ---
+# Reads GEMINI_API_KEY or GOOGLE_API_KEY from environment variables
+api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+gemini_client = genai.Client(api_key=api_key) if api_key else None
 LLM_MODEL = "gemini-2.5-flash"
 
 
-# --- Schemas ---
+# --- Request / response schemas ---
 class ScreeningInput(BaseModel):
     gender: Literal["Female", "Male", "Other"]
     age: float = Field(..., ge=0, le=120)
@@ -53,6 +71,10 @@ class ScreeningResult(BaseModel):
 
 # --- Helpers ---
 def risk_tier_from_probability(probability: float, threshold: float) -> str:
+    """
+    Three-tier bucket for display purposes. The binary `flagged` field
+    uses the model's own recall-tuned threshold.
+    """
     if probability < 0.15:
         return "Low"
     elif probability < threshold:
@@ -81,14 +103,20 @@ Keep it under 180 words, speak directly to the user ("you"), do not diagnose, an
 
 
 # --- Routes ---
+@app.get("/")
 @app.get("/health")
 def health():
-    return {"status": "ok"}
+    return {
+        "status": "ok",
+        "service": "SugarTalk API",
+        "gemini_connected": gemini_client is not None
+    }
 
 
 @app.post("/predict", response_model=ScreeningResult)
 async def predict(data: ScreeningInput):
     try:
+        # 1. Prepare tabular feature row
         row = pd.DataFrame([{
             "gender": data.gender,
             "age": data.age,
@@ -98,21 +126,28 @@ async def predict(data: ScreeningInput):
             "bmi": data.bmi,
         }])
 
+        # 2. Run Random Forest Inference
         probability = float(model.predict_proba(row)[:, 1][0])
         tier = risk_tier_from_probability(probability, flag_threshold)
         flagged = bool(probability >= flag_threshold)
 
-        recommendations = "Consult a licensed medical provider for confirmatory laboratory testing."
-        try:
-            prompt = build_recommendation_prompt(data, probability, tier)
-            response = gemini_client.models.generate_content(
-                model=LLM_MODEL,
-                contents=prompt,
-            )
-            if response.text:
-                recommendations = response.text
-        except Exception as llm_err:
-            print(f"Gemini generation error: {llm_err}")
+        # 3. LLM Recommendation Synthesis
+        recommendations = (
+            "We recommend consulting a healthcare professional for standard confirmatory "
+            "laboratory testing (e.g., Fasting Blood Glucose or HbA1c)."
+        )
+
+        if gemini_client:
+            try:
+                prompt = build_recommendation_prompt(data, probability, tier)
+                response = gemini_client.models.generate_content(
+                    model=LLM_MODEL,
+                    contents=prompt,
+                )
+                if response.text:
+                    recommendations = response.text
+            except Exception as llm_err:
+                print(f"Gemini generation error: {llm_err}")
 
         return ScreeningResult(
             probability=round(probability, 4),
