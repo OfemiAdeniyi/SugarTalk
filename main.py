@@ -24,7 +24,6 @@ from pydantic import BaseModel, Field
 app = FastAPI(title="SugarTalk Diabetes Screening & Q&A API")
 
 # --- CORS Middleware ---
-# Configured to allow cross-origin requests from Lovable and local web clients
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -47,8 +46,10 @@ with open(THRESHOLD_PATH, "rb") as f:
 # --- Gemini Client Configuration ---
 api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
 gemini_client = genai.Client(api_key=api_key) if api_key else None
-PRIMARY_LLM = "gemini-2.5-flash"
-FALLBACK_LLM = "gemini-2.0-flash"
+
+# Active Gemini models
+PRIMARY_LLM = "gemini-3.6-flash"
+FALLBACK_LLM = "gemini-3.6-flash-lite"
 
 
 # --- Schemas: Screening ---
@@ -71,9 +72,9 @@ class ScreeningResult(BaseModel):
 # --- Schemas: Chat ---
 class ChatRequest(BaseModel):
     message: Optional[str] = None
-    text: Optional[str] = None  # Fallback field for Lovable frontend variants
+    text: Optional[str] = None
     risk_tier: Optional[str] = "Unknown"
-    history: Optional[List[Any]] = []  # Permissive list to handle varying dict/object structures
+    history: Optional[List[Any]] = []
 
 
 class ChatResponse(BaseModel):
@@ -124,7 +125,6 @@ def health():
 @app.post("/predict", response_model=ScreeningResult)
 async def predict(data: ScreeningInput):
     try:
-        # Construct DataFrame matching the scikit-learn pipeline columns
         row = pd.DataFrame([{
             "gender": data.gender,
             "age": data.age,
@@ -152,7 +152,7 @@ async def predict(data: ScreeningInput):
                         contents=prompt,
                     )
                 except Exception as primary_err:
-                    print(f"[WARN] Primary model failed in /predict: {primary_err}. Trying fallback...")
+                    print(f"[WARN] Primary model failed in /predict: {primary_err}. Trying fallback {FALLBACK_LLM}...")
                     response = gemini_client.models.generate_content(
                         model=FALLBACK_LLM,
                         contents=prompt,
@@ -190,7 +190,6 @@ async def chat_with_assistant(req: ChatRequest):
         )
 
     try:
-        # Build conversational history safely regardless of frontend payload formatting
         history_lines = []
         if req.history:
             for item in req.history[-6:]:
