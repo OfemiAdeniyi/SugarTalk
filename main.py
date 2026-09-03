@@ -3,15 +3,13 @@ SugarTalk Backend
 ==================
 Exposes:
   1. POST /predict -> ML screening probability + risk tier + Gemini recommendations
-  2. POST /chat    -> Interactive diabetes Q&A assistant with clinical guardrails
+  2. POST /chat    -> Interactive diabetes Q&A assistant with high-demand retry handling
   3. GET  /health  -> Health and service readiness check
-
-Environment variables expected:
-  GEMINI_API_KEY -> Google GenAI API key from aistudio.google.com/apikey
 """
 
 import os
 import pickle
+import time
 import traceback
 from typing import Any, List, Literal, Optional
 
@@ -47,9 +45,15 @@ with open(THRESHOLD_PATH, "rb") as f:
 api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
 gemini_client = genai.Client(api_key=api_key) if api_key else None
 
-# Active Gemini models
-PRIMARY_LLM = "gemini-3.6-flash"
-FALLBACK_LLM = "gemini-3.6-flash-lite"
+# Diverse fallback pool to bypass localized cluster 503 capacity limits
+CANDIDATE_MODELS = [
+    "gemini-2.5-flash",
+    "gemini-2.0-flash",
+    "gemini-1.5-flash",
+    "gemini-2.5-pro",
+    "gemini-3.6-flash",
+    "gemini-3.6-flash-lite",
+]
 
 
 # --- Schemas: Screening ---
@@ -83,7 +87,6 @@ class ChatResponse(BaseModel):
 
 # --- Helper Functions ---
 def risk_tier_from_probability(probability: float, threshold: float) -> str:
-    """Classifies risk into display buckets."""
     if probability < 0.15:
         return "Low"
     elif probability < threshold:
@@ -92,8 +95,32 @@ def risk_tier_from_probability(probability: float, threshold: float) -> str:
         return "High"
 
 
+def generate_with_resilience(prompt: str) -> str:
+    """Tries generation across multiple model families with retries on 503/429 spikes."""
+    if not gemini_client:
+        return ""
+
+    for target_model in CANDIDATE_MODELS:
+        for attempt in range(2):  # Try twice per model
+            try:
+                resp = gemini_client.models.generate_content(
+                    model=target_model,
+                    contents=prompt,
+                )
+                if resp and resp.text:
+                    return resp.text
+            except Exception as err:
+                err_str = str(err)
+                print(f"[WARN] Model {target_model} attempt {attempt+1} failed: {err_str}")
+                if "503" in err_str or "UNAVAILABLE" in err_str or "429" in err_str:
+                    time.sleep(1.2)  # Brief delay to allow transient spike to clear
+                else:
+                    break  # Not a transient capacity issue, skip to next candidate model
+    return ""
+
+
 def build_recommendation_prompt(data: ScreeningInput, probability: float, tier: str) -> str:
-    return f"""A user completed a diabetes risk screening (NOT a formal clinical diagnosis) with these inputs:
+    return f"""A user completed a diabetes risk screening (NOT a diagnosis) with these inputs:
 - Gender: {data.gender}
 - Age: {data.age}
 - Hypertension: {"Yes" if data.hypertension else "No"}
@@ -103,10 +130,10 @@ def build_recommendation_prompt(data: ScreeningInput, probability: float, tier: 
 
 Model output: estimated risk probability {probability:.0%}, risk tier: {tier}.
 
-Write a short, warm, supportive, and non-alarming message for the user with:
+Write a short, warm, supportive message for the user with:
 1. One plain-language sentence explaining what this risk tier indicates.
 2. 3-4 practical lifestyle tips relevant to their inputs (nutrition, activity, smoking cessation, weight management).
-3. A clear recommendation for a confirmatory fasting glucose or HbA1c lab test at a clinic (make this firmer if Moderate or High).
+3. A clear recommendation for a confirmatory fasting glucose or HbA1c lab test at a clinic.
 
 Keep it under 180 words, address the user directly ("you"), do not diagnose, and do not suggest any medication or dosages."""
 
@@ -138,30 +165,14 @@ async def predict(data: ScreeningInput):
         tier = risk_tier_from_probability(probability, flag_threshold)
         flagged = bool(probability >= flag_threshold)
 
-        recommendations = (
+        default_recs = (
             "We recommend consulting a healthcare professional for standard confirmatory "
             "laboratory testing (such as a Fasting Blood Glucose or HbA1c test)."
         )
 
-        if gemini_client:
-            try:
-                prompt = build_recommendation_prompt(data, probability, tier)
-                try:
-                    response = gemini_client.models.generate_content(
-                        model=PRIMARY_LLM,
-                        contents=prompt,
-                    )
-                except Exception as primary_err:
-                    print(f"[WARN] Primary model failed in /predict: {primary_err}. Trying fallback {FALLBACK_LLM}...")
-                    response = gemini_client.models.generate_content(
-                        model=FALLBACK_LLM,
-                        contents=prompt,
-                    )
-
-                if response and response.text:
-                    recommendations = response.text
-            except Exception as llm_err:
-                print(f"[ERROR] LLM generation failed in /predict: {llm_err}")
+        prompt = build_recommendation_prompt(data, probability, tier)
+        llm_output = generate_with_resilience(prompt)
+        recommendations = llm_output if llm_output else default_recs
 
         return ScreeningResult(
             probability=round(probability, 4),
@@ -181,13 +192,6 @@ async def chat_with_assistant(req: ChatRequest):
     user_query = req.message or req.text
     if not user_query:
         raise HTTPException(status_code=400, detail="Missing message or text in request payload.")
-
-    if not gemini_client:
-        print("[ERROR] gemini_client is None. Ensure GEMINI_API_KEY is set in Render Environment variables.")
-        raise HTTPException(
-            status_code=500,
-            detail="AI assistant service is currently unconfigured on the server."
-        )
 
     try:
         history_lines = []
@@ -222,24 +226,19 @@ Guidelines:
             f"Assistant:"
         )
 
-        response_text = ""
-        try:
-            resp = gemini_client.models.generate_content(
-                model=PRIMARY_LLM,
-                contents=full_prompt,
-            )
-            response_text = resp.text
-        except Exception as primary_err:
-            print(f"[WARN] Primary model failed in /chat ({primary_err}). Trying fallback {FALLBACK_LLM}...")
-            resp = gemini_client.models.generate_content(
-                model=FALLBACK_LLM,
-                contents=full_prompt,
-            )
-            response_text = resp.text
+        reply_text = generate_with_resilience(full_prompt)
 
-        return ChatResponse(
-            reply=response_text or "I'm here to help, but could not generate a response. Please rephrase your question."
-        )
+        # Resilient fallback so the frontend never receives a 500 error during cloud outages
+        if not reply_text:
+            reply_text = (
+                "Our AI assistant is momentarily experiencing high server traffic. "
+                "In general, maintaining a balanced diet rich in fiber, staying physically active "
+                "with at least 150 minutes of moderate exercise per week, and scheduling regular "
+                "HbA1c or fasting glucose screenings are key steps for metabolic wellness. "
+                "Please ask your question again in a few moments."
+            )
+
+        return ChatResponse(reply=reply_text)
 
     except Exception as e:
         print("[ERROR] Exception in /chat:")
